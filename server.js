@@ -1,85 +1,150 @@
-import express from "express";
-import cors from "cors";
-import multer from "multer";
-import OpenAI from "openai";
-import * as XLSX from "xlsx/xlsx.mjs";
-import dotenv from "dotenv";
-import fs from "fs/promises";
-import path from "path";
-import { fileURLToPath } from "url";
-import excelToJson from "convert-excel-to-json";
-import { log } from "console";
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const multer = require('multer');
+const path = require('path');
+const dotenv = require('dotenv')
 
-dotenv.config();
 const app = express();
+const PORT = process.env.PORT || 5000;
+
+// Middleware
+dotenv.config();
 app.use(cors());
 app.use(express.json());
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// OpenAI Configuration
-const openai = new OpenAI({
-  apiKey: "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"
+// MongoDB Connection
+mongoose.connect(process.env.MONGO_URL, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
 });
 
+// Menu Item Schema
+const MenuItemSchema = new mongoose.Schema({
+  name: { type: String, required: true },
+  description: { type: String, required: true },
+  price: { type: Number, required: true },
+  image: { type: String },
+});
+
+// Order Schema
+const OrderSchema = new mongoose.Schema({
+  items: [{ 
+    menuItem: { type: mongoose.Schema.Types.ObjectId, ref: 'MenuItem' },
+    quantity: Number 
+  }],
+  totalPrice: Number,
+  status: { 
+    type: String, 
+    enum: ['Pending', 'Preparing', 'Ready', 'Completed'], 
+    default: 'Pending' 
+  },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const MenuItem = mongoose.model('MenuItem', MenuItemSchema);
+const Order = mongoose.model('Order', OrderSchema);
+
+// Multer configuration for image upload
 const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, "uploads/");
+  destination: (req, file, cb) => {
+    cb(null, 'uploads/');
   },
-  filename: function (req, file, cb) {
-    cb(null, file.originalname);
-  },
+  filename: (req, file, cb) => {
+    cb(null, Date.now() + path.extname(file.originalname));
+  }
 });
+const upload = multer({ storage: storage });
 
-const upload = multer({ storage });
-
-app.post("/api/upload", upload.single("file"), (req, res) => {
+// Admin Routes
+app.post('/api/menu-items', upload.single('image'), async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: "No file uploaded" });
-    }
-
-    // Access file details
-    const { path, originalname, mimetype, size } = req.file;
-
-    const result = excelToJson({
-      sourceFile: path
-  });
-
-    res.status(200).json({ success: "file upload successful", data: result });
+    const { name, description, price } = req.body;
+    const newMenuItem = new MenuItem({
+      name,
+      description,
+      price: parseFloat(price),
+      image: req.file ? req.file.path : null
+    });
+    await newMenuItem.save();
+    res.status(201).json(newMenuItem);
   } catch (error) {
-    res.status(500).json({ error: error });
+    res.status(400).json({ message: error.message });
   }
 });
 
-// Chat Endpoint
-app.post("/api/chat", async (req, res) => {
-  const { message, financialContext } = req.body;  
-
+app.get('/api/menu-items', async (req, res) => {
   try {
-    const response = await openai.chat.completions.create({
-      model: "gpt-3.5-turbo",
-      messages: [
-        { 
-          role: "system", 
-          content: "You are a helpful data analyst assistant." 
-        },
-        { 
-          role: "user", 
-          content: `Analyze this sales data: ${JSON.stringify(financialContext)}. And answer ${message}.`
-        }
-      ]
-    });
-
-    console.log(response.choices[0].message.content);
-
-    res.json({
-      reply: response.choices[0].message.content,
-    });
+    const menuItems = await MenuItem.find();
+    res.json(menuItems);
   } catch (error) {
-    res.status(500).json({ error: "AI processing failed" });
+    res.status(500).json({ message: error.message });
   }
 });
 
-const PORT = process.env.PORT || 5000;
+// Order Routes
+app.post('/api/orders', async (req, res) => {
+  try {
+    const { items } = req.body;
+    
+    // Calculate total price
+    const orderItems = await Promise.all(items.map(async (item) => {
+      const menuItem = await MenuItem.findById(item.menuItemId);
+      return {
+        menuItem: menuItem._id,
+        quantity: item.quantity
+      };
+    }));
+
+    const totalPrice = await calculateTotalPrice(orderItems);
+
+    const newOrder = new Order({
+      items: orderItems,
+      totalPrice
+    });
+
+    await newOrder.save();
+    res.status(201).json(newOrder);
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+});
+
+app.get('/api/orders', async (req, res) => {
+  try {
+    const orders = await Order.find().populate('items.menuItem');
+    res.json(orders);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Utility function to calculate total price
+async function calculateTotalPrice(orderItems) {
+  let total = 0;
+  for (let item of orderItems) {
+    const menuItem = await MenuItem.findById(item.menuItem);
+    total += menuItem.price * item.quantity;
+  }
+  return total;
+}
+
+// Update Order Status
+app.patch('/api/orders/:id', async (req, res) => {
+  try {
+    const { status } = req.body;
+    const updatedOrder = await Order.findByIdAndUpdate(
+      req.params.id, 
+      { status }, 
+      { new: true }
+    );
+    res.json(updatedOrder);
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
